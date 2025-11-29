@@ -1,0 +1,92 @@
+# cert-manager를 사용한 자체 서명 CA 및 인증서 발급
+# 이 파일은 테스트용 내부 CA를 생성합니다
+
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
+---
+# 내부 CA용 인증서 (이 인증서가 다른 인증서에 서명)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-lab-ca
+  namespace: tls-lab
+spec:
+  isCA: true
+  commonName: tls-lab-ca
+  secretName: tls-lab-ca-secret
+  duration: 87600h # 10년
+  renewBefore: 8760h # 1년 전 갱신
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+  subject:
+    organizations:
+      - "TLS Lab Internal"
+    organizationalUnits:
+      - "DevOps Practice"
+---
+# 내부 CA를 사용하는 Issuer
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: tls-lab-ca-issuer
+  namespace: tls-lab
+spec:
+  ca:
+    secretName: tls-lab-ca-secret
+---
+# TLS 서버용 인증서
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-server-cert
+  namespace: tls-lab
+spec:
+  secretName: tls-server-secret
+  duration: 2160h # 90일
+  renewBefore: 360h # 15일 전 갱신
+  commonName: tls-server.tls-lab.svc.cluster.local
+  dnsNames:
+    - tls-server
+    - tls-server.tls-lab
+    - tls-server.tls-lab.svc
+    - tls-server.tls-lab.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: tls-lab-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+# mTLS 테스트용 클라이언트 인증서
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tls-client-cert
+  namespace: tls-lab
+spec:
+  secretName: tls-client-secret
+  duration: 2160h
+  renewBefore: 360h
+  commonName: java-tls-lab-client
+  usages:
+    - client auth
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: tls-lab-ca-issuer
+    kind: Issuer
+    group: cert-manager.io

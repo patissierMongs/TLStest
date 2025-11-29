@@ -1,0 +1,477 @@
+# Java TLS/SSL 실습 환경 Pod
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: java-lab-scripts
+  namespace: tls-lab
+data:
+  extract-certs.sh: |
+    #!/bin/bash
+    # 서버에서 인증서 체인을 추출하는 스크립트
+    
+    if [ -z "$1" ]; then
+        echo "Usage: $0 <hostname> [port]"
+        echo "Example: $0 google.com 443"
+        exit 1
+    fi
+    
+    HOST=$1
+    PORT=${2:-443}
+    OUTPUT_DIR="/workspace/certs/${HOST}"
+    
+    mkdir -p "$OUTPUT_DIR"
+    
+    echo "🔐 Extracting certificate chain from ${HOST}:${PORT}..."
+    
+    # 전체 체인 다운로드
+    openssl s_client -connect "${HOST}:${PORT}" -showcerts </dev/null 2>/dev/null > "${OUTPUT_DIR}/full-chain.pem"
+    
+    # 각 인증서 분리
+    awk -v dir="$OUTPUT_DIR" -v host="$HOST" '
+        /-----BEGIN CERTIFICATE-----/ { cert_num++; in_cert=1 }
+        in_cert { print > (dir "/" host "-" (cert_num-1) ".crt") }
+        /-----END CERTIFICATE-----/ { in_cert=0 }
+    ' "${OUTPUT_DIR}/full-chain.pem"
+    
+    echo ""
+    echo "📜 Extracted certificates:"
+    for cert in "${OUTPUT_DIR}"/*.crt; do
+        if [ -f "$cert" ]; then
+            subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/subject=//')
+            issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+            echo ""
+            echo "📄 $(basename $cert)"
+            echo "   Subject: $subject"
+            echo "   Issuer:  $issuer"
+        fi
+    done
+    
+    echo ""
+    echo "✅ Certificates saved to: ${OUTPUT_DIR}/"
+    
+  test-tls.sh: |
+    #!/bin/bash
+    # TLS 연결 테스트 스크립트
+    
+    if [ -z "$1" ]; then
+        echo "Usage: $0 <url> [keystore_path]"
+        echo "Example: $0 https://google.com"
+        echo "Example: $0 https://tls-server:443 /workspace/certs/test-cacerts"
+        exit 1
+    fi
+    
+    URL=$1
+    KEYSTORE=${2:-"$JAVA_HOME/lib/security/cacerts"}
+    KEYSTORE_PASS=${3:-"changeit"}
+    
+    echo "🧪 Testing TLS connection to: $URL"
+    echo "🔑 Using KeyStore: $KEYSTORE"
+    echo ""
+    
+    cd /workspace/java-app
+    
+    java -Djavax.net.ssl.trustStore="$KEYSTORE" \
+         -Djavax.net.ssl.trustStorePassword="$KEYSTORE_PASS" \
+         TLSConnectionTest "$URL"
+         
+  verify-cert.sh: |
+    #!/bin/bash
+    # 인증서 체인 검증 스크립트
+    
+    if [ -z "$1" ]; then
+        echo "Usage: $0 <cert_file> [ca_file]"
+        exit 1
+    fi
+    
+    CERT=$1
+    CA=${2:-""}
+    
+    echo "📋 Certificate Information:"
+    echo "=========================="
+    
+    echo ""
+    echo "🏷️ Subject:"
+    openssl x509 -in "$CERT" -noout -subject
+    
+    echo ""
+    echo "🏢 Issuer:"
+    openssl x509 -in "$CERT" -noout -issuer
+    
+    echo ""
+    echo "📅 Validity:"
+    openssl x509 -in "$CERT" -noout -dates
+    
+    echo ""
+    echo "🌐 Subject Alternative Names (SAN):"
+    openssl x509 -in "$CERT" -noout -text | grep -A1 "Subject Alternative Name" | tail -1
+    
+    echo ""
+    echo "🔐 Key Info:"
+    openssl x509 -in "$CERT" -noout -text | grep -A2 "Public Key Algorithm"
+    
+    if [ -n "$CA" ]; then
+        echo ""
+        echo "✅ Chain Verification:"
+        openssl verify -CAfile "$CA" "$CERT"
+    fi
+
+  setup-workspace.sh: |
+    #!/bin/bash
+    # 작업 환경 초기화 스크립트
+    
+    echo "🚀 Setting up Java TLS Lab workspace..."
+    
+    # 디렉토리 생성
+    mkdir -p /workspace/certs
+    mkdir -p /workspace/java-app
+    mkdir -p /workspace/scripts
+    mkdir -p /workspace/logs
+    
+    # 원본 cacerts 복사
+    if [ ! -f /workspace/certs/test-cacerts ]; then
+        cp $JAVA_HOME/lib/security/cacerts /workspace/certs/test-cacerts
+        chmod 644 /workspace/certs/test-cacerts
+        echo "✅ Created test-cacerts copy"
+    fi
+    
+    # Java 테스트 파일 복사
+    cp /opt/scripts/*.java /workspace/java-app/ 2>/dev/null || true
+    
+    # 스크립트 복사
+    cp /opt/scripts/*.sh /workspace/scripts/ 2>/dev/null || true
+    chmod +x /workspace/scripts/*.sh 2>/dev/null || true
+    
+    # 컴파일
+    cd /workspace/java-app
+    javac *.java 2>/dev/null || true
+    
+    echo ""
+    echo "📂 Workspace ready at /workspace"
+    echo ""
+    echo "Available commands:"
+    echo "  /opt/scripts/extract-certs.sh <hostname>  - Extract cert chain"
+    echo "  /opt/scripts/test-tls.sh <url>            - Test TLS connection"
+    echo "  /opt/scripts/verify-cert.sh <cert>        - Verify certificate"
+    echo ""
+    echo "Network tools available:"
+    echo "  curl, wget, dig, nslookup, ping, traceroute, netcat (nc)"
+    echo ""
+    
+  TLSConnectionTest.java: |
+    import javax.net.ssl.*;
+    import java.net.*;
+    import java.io.*;
+    import java.security.cert.*;
+    
+    public class TLSConnectionTest {
+        public static void main(String[] args) {
+            if (args.length < 1) {
+                System.out.println("Usage: java TLSConnectionTest <url>");
+                System.out.println("Example: java TLSConnectionTest https://google.com");
+                System.exit(1);
+            }
+            
+            String urlStr = args[0];
+            System.out.println("🔐 Testing TLS connection to: " + urlStr);
+            System.out.println("═".repeat(50));
+            
+            try {
+                URL url = new URL(urlStr);
+                HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(10000);
+                
+                // 연결 수립
+                conn.connect();
+                
+                // SSL 세션 정보
+                SSLSession session = conn.getSSLSession().orElse(null);
+                if (session != null) {
+                    System.out.println("\n✅ TLS Connection Successful!");
+                    System.out.println("─".repeat(50));
+                    System.out.println("Protocol:     " + session.getProtocol());
+                    System.out.println("Cipher Suite: " + session.getCipherSuite());
+                    System.out.println("Peer Host:    " + session.getPeerHost());
+                    
+                    // 서버 인증서 체인
+                    Certificate[] certs = session.getPeerCertificates();
+                    System.out.println("\n📜 Certificate Chain (" + certs.length + " certs):");
+                    System.out.println("─".repeat(50));
+                    
+                    for (int i = 0; i < certs.length; i++) {
+                        if (certs[i] instanceof X509Certificate) {
+                            X509Certificate x509 = (X509Certificate) certs[i];
+                            String type = (i == 0) ? "Server" : (i == certs.length - 1) ? "Root CA" : "Intermediate";
+                            System.out.println("\n[" + i + "] " + type + " Certificate:");
+                            System.out.println("    Subject: " + x509.getSubjectX500Principal().getName());
+                            System.out.println("    Issuer:  " + x509.getIssuerX500Principal().getName());
+                            System.out.println("    Valid:   " + x509.getNotBefore() + " ~ " + x509.getNotAfter());
+                            System.out.println("    Serial:  " + x509.getSerialNumber().toString(16));
+                        }
+                    }
+                }
+                
+                // HTTP 응답
+                int responseCode = conn.getResponseCode();
+                System.out.println("\n📡 HTTP Response: " + responseCode);
+                
+                if (responseCode == 200) {
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                    String line;
+                    StringBuilder response = new StringBuilder();
+                    while ((line = reader.readLine()) != null) {
+                        response.append(line);
+                    }
+                    reader.close();
+                    if (response.length() < 500) {
+                        System.out.println("Response: " + response.toString());
+                    }
+                }
+                
+                conn.disconnect();
+                System.out.println("\n✅ Test completed successfully!");
+                
+            } catch (SSLHandshakeException e) {
+                System.err.println("\n❌ SSL Handshake Failed!");
+                System.err.println("─".repeat(50));
+                System.err.println("Error: " + e.getMessage());
+                System.err.println("\n💡 Possible causes:");
+                System.err.println("   - Server certificate not trusted");
+                System.err.println("   - Root CA not in truststore");
+                System.err.println("   - Certificate expired");
+                System.err.println("   - Hostname mismatch");
+                System.err.println("\n🔧 Try adding the root CA to your truststore:");
+                System.err.println("   keytool -importcert -keystore ./test-cacerts -alias <alias> -file <ca.crt>");
+                e.printStackTrace();
+                System.exit(1);
+            } catch (Exception e) {
+                System.err.println("\n❌ Connection Failed: " + e.getMessage());
+                e.printStackTrace();
+                System.exit(1);
+            }
+        }
+    }
+
+  CertificateChainValidator.java: |
+    import javax.net.ssl.*;
+    import java.net.*;
+    import java.io.*;
+    import java.security.*;
+    import java.security.cert.*;
+    import java.util.*;
+    
+    public class CertificateChainValidator {
+        public static void main(String[] args) throws Exception {
+            if (args.length < 1) {
+                System.out.println("Usage: java CertificateChainValidator <url>");
+                System.exit(1);
+            }
+            
+            String urlStr = args[0];
+            URL url = new URL(urlStr);
+            
+            System.out.println("🔍 Validating certificate chain for: " + urlStr);
+            System.out.println("═".repeat(60));
+            
+            // SSL Context 설정
+            SSLContext ctx = SSLContext.getInstance("TLS");
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            
+            String trustStorePath = System.getProperty("javax.net.ssl.trustStore");
+            if (trustStorePath != null) {
+                KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                try (FileInputStream fis = new FileInputStream(trustStorePath)) {
+                    String password = System.getProperty("javax.net.ssl.trustStorePassword", "changeit");
+                    ks.load(fis, password.toCharArray());
+                }
+                tmf.init(ks);
+                System.out.println("📁 Using custom truststore: " + trustStorePath);
+            } else {
+                tmf.init((KeyStore) null);
+                System.out.println("📁 Using default truststore");
+            }
+            
+            ctx.init(null, tmf.getTrustManagers(), null);
+            
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setSSLSocketFactory(ctx.getSocketFactory());
+            conn.setHostnameVerifier((hostname, session) -> {
+                System.out.println("\n🌐 Hostname Verification:");
+                System.out.println("   Expected: " + hostname);
+                
+                try {
+                    Certificate[] certs = session.getPeerCertificates();
+                    if (certs[0] instanceof X509Certificate) {
+                        X509Certificate x509 = (X509Certificate) certs[0];
+                        
+                        // CN 확인
+                        String cn = extractCN(x509.getSubjectX500Principal().getName());
+                        System.out.println("   CN: " + cn);
+                        
+                        // SAN 확인
+                        Collection<List<?>> sans = x509.getSubjectAlternativeNames();
+                        if (sans != null) {
+                            System.out.println("   SANs:");
+                            for (List<?> san : sans) {
+                                Integer type = (Integer) san.get(0);
+                                String name = san.get(1).toString();
+                                String typeStr = (type == 2) ? "DNS" : (type == 7) ? "IP" : "Other";
+                                System.out.println("      - " + typeStr + ": " + name);
+                                
+                                if (type == 2 && matchesHostname(hostname, name)) {
+                                    System.out.println("   ✅ Hostname matches SAN");
+                                    return true;
+                                }
+                            }
+                        }
+                        
+                        if (matchesHostname(hostname, cn)) {
+                            System.out.println("   ✅ Hostname matches CN");
+                            return true;
+                        }
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                
+                System.out.println("   ❌ Hostname verification failed");
+                return false;
+            });
+            
+            try {
+                conn.connect();
+                
+                System.out.println("\n✅ Certificate chain validated successfully!");
+                System.out.println("\n📊 Connection Details:");
+                System.out.println("   Response: " + conn.getResponseCode() + " " + conn.getResponseMessage());
+                
+                SSLSession session = conn.getSSLSession().orElse(null);
+                if (session != null) {
+                    System.out.println("   Protocol: " + session.getProtocol());
+                    System.out.println("   Cipher: " + session.getCipherSuite());
+                }
+                
+            } catch (SSLHandshakeException e) {
+                System.err.println("\n❌ Certificate validation failed!");
+                System.err.println("Error: " + e.getMessage());
+                
+                Throwable cause = e.getCause();
+                while (cause != null) {
+                    System.err.println("Caused by: " + cause.getMessage());
+                    cause = cause.getCause();
+                }
+            }
+        }
+        
+        private static String extractCN(String dn) {
+            for (String part : dn.split(",")) {
+                String trimmed = part.trim();
+                if (trimmed.startsWith("CN=")) {
+                    return trimmed.substring(3);
+                }
+            }
+            return "";
+        }
+        
+        private static boolean matchesHostname(String hostname, String pattern) {
+            if (pattern.startsWith("*.")) {
+                String suffix = pattern.substring(1);
+                int dotIndex = hostname.indexOf('.');
+                if (dotIndex > 0) {
+                    return hostname.substring(dotIndex).equalsIgnoreCase(suffix);
+                }
+            }
+            return hostname.equalsIgnoreCase(pattern);
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: java-tls-lab
+  namespace: tls-lab
+  labels:
+    app: java-tls-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: java-tls-lab
+  template:
+    metadata:
+      labels:
+        app: java-tls-lab
+    spec:
+      containers:
+        - name: java-lab
+          image: eclipse-temurin:21-jdk
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              echo "📦 Installing required packages..."
+              apt-get update -qq
+              apt-get install -y -qq \
+                curl \
+                wget \
+                dnsutils \
+                iputils-ping \
+                traceroute \
+                netcat-openbsd \
+                net-tools \
+                vim \
+                less \
+                jq \
+                > /dev/null 2>&1
+              echo "✅ Packages installed"
+              
+              # 스크립트 실행 권한 설정
+              chmod +x /opt/scripts/*.sh
+              
+              # 작업 환경 초기화
+              /opt/scripts/setup-workspace.sh
+              
+              # 무한 대기 (Pod 유지)
+              echo ""
+              echo "═══════════════════════════════════════════════════════════"
+              echo "🎯 Java TLS Lab ready! Use 'kubectl exec' to connect."
+              echo "═══════════════════════════════════════════════════════════"
+              echo ""
+              tail -f /dev/null
+          env:
+            - name: JAVA_HOME
+              value: /opt/java/openjdk
+            - name: DEBIAN_FRONTEND
+              value: noninteractive
+          volumeMounts:
+            - name: scripts
+              mountPath: /opt/scripts
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: scripts
+          configMap:
+            name: java-lab-scripts
+            defaultMode: 0755
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: java-tls-lab
+  namespace: tls-lab
+spec:
+  selector:
+    app: java-tls-lab
+  ports:
+    - name: debug
+      port: 5005
+      targetPort: 5005
+  type: ClusterIP
